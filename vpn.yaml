@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS CloudFormation template to create an OpenVPN server on a t2.micro EC2 instance with minimal user interaction
+Description: AWS CloudFormation template to create an OpenVPN server on a t2.micro EC2 instance with minimal user interaction. Users can optionally enable logging of network traffic and websites visited.
 
 Parameters:
   Region:
@@ -29,6 +29,19 @@ Parameters:
       - sa-east-1
     ConstraintDescription: Must be a valid AWS region
     Default: us-east-1
+
+  EnableLogging:
+    Type: String
+    Description: "Enable logging of network traffic and websites visited. This may incur additional costs."
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "No"
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: 'Latest Amazon Linux 2 AMI ID'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
 
 Resources:
   VPC:
@@ -60,7 +73,6 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: '10.0.1.0/24'
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [ 0, !GetAZs !Ref "AWS::Region" ]
       Tags:
         - Key: Name
           Value: PublicSubnet
@@ -101,6 +113,10 @@ Resources:
           FromPort: 1194
           ToPort: 1194
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
           Value: VPNSecurityGroup
@@ -109,7 +125,7 @@ Resources:
     Type: 'AWS::EC2::Instance'
     Properties:
       InstanceType: t2.micro
-      ImageId: ami-0a91cd140a1fc148a # Ubuntu Server 20.04 LTS (Replace with region-specific AMI)
+      ImageId: !Ref LatestAmiId
       NetworkInterfaces:
         - AssociatePublicIpAddress: true
           DeviceIndex: '0'
@@ -119,8 +135,15 @@ Resources:
       UserData:
         Fn::Base64: |
           #!/bin/bash
-          apt-get update
-          apt-get install -y openvpn easy-rsa
+          exec > /var/log/user-data.log 2>&1
+          echo "Starting user data script"
+          echo "Installing updates and dependencies"
+          yum update -y
+          yum install -y openvpn easy-rsa httpd amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+          
+          echo "Setting up OpenVPN"
           make-cadir ~/openvpn-ca
           cd ~/openvpn-ca
           source vars
@@ -160,12 +183,16 @@ Resources:
           EOF
           systemctl start openvpn@server
           systemctl enable openvpn@server
-          mkdir -p /home/ubuntu/client-configs/keys
-          cp ~/openvpn-ca/keys/ca.crt /home/ubuntu/client-configs/keys/
-          cp ~/openvpn-ca/keys/client1.crt /home/ubuntu/client-configs/keys/
-          cp ~/openvpn-ca/keys/client1.key /home/ubuntu/client-configs/keys/
-          cp ~/openvpn-ca/keys/ta.key /home/ubuntu/client-configs/keys/
-          cat > /home/ubuntu/client-configs/base.conf <<-EOF
+          
+          echo "Setting up web server"
+          systemctl start httpd
+          systemctl enable httpd
+          mkdir -p /home/ec2-user/client-configs/keys
+          cp ~/openvpn-ca/keys/ca.crt /home/ec2-user/client-configs/keys/
+          cp ~/openvpn-ca/keys/client1.crt /home/ec2-user/client-configs/keys/
+          cp ~/openvpn-ca/keys/client1.key /home/ec2-user/client-configs/keys/
+          cp ~/openvpn-ca/keys/ta.key /home/ec2-user/client-configs/keys/
+          cat > /home/ec2-user/client-configs/base.conf <<-EOF
           client
           dev tun
           proto udp
@@ -180,57 +207,82 @@ Resources:
           key-direction 1
           verb 3
           EOF
-          cat /home/ubuntu/client-configs/base.conf > /home/ubuntu/client-configs/client1.ovpn
-          echo '<ca>' >> /home/ubuntu/client-configs/client1.ovpn
-          cat /home/ubuntu/client-configs/keys/ca.crt >> /home/ubuntu/client-configs/client1.ovpn
-          echo '</ca>' >> /home/ubuntu/client-configs/client1.ovpn
-          echo '<cert>' >> /home/ubuntu/client-configs/client1.ovpn
-          cat /home/ubuntu/client-configs/keys/client1.crt >> /home/ubuntu/client-configs/client1.ovpn
-          echo '</cert>' >> /home/ubuntu/client-configs/client1.ovpn
-          echo '<key>' >> /home/ubuntu/client-configs/client1.ovpn
-          cat /home/ubuntu/client-configs/keys/client1.key >> /home/ubuntu/client-configs/client1.ovpn
-          echo '</key>' >> /home/ubuntu/client-configs/client1.ovpn
-          echo '<tls-auth>' >> /home/ubuntu/client-configs/client1.ovpn
-          cat /home/ubuntu/client-configs/keys/ta.key >> /home/ubuntu/client-configs/client1.ovpn
-          echo '</tls-auth>' >> /home/ubuntu/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/base.conf > /home/ec2-user/client-configs/client1.ovpn
+          echo '<ca>' >> /home/ec2-user/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/keys/ca.crt >> /home/ec2-user/client-configs/client1.ovpn
+          echo '</ca>' >> /home/ec2-user/client-configs/client1.ovpn
+          echo '<cert>' >> /home/ec2-user/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/keys/client1.crt >> /home/ec2-user/client-configs/client1.ovpn
+          echo '</cert>' >> /home/ec2-user/client-configs/client1.ovpn
+          echo '<key>' >> /home/ec2-user/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/keys/client1.key >> /home/ec2-user/client-configs/client1.ovpn
+          echo '</key>' >> /home/ec2-user/client-configs/client1.ovpn
+          echo '<tls-auth>' >> /home/ec2-user/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/keys/ta.key >> /home/ec2-user/client-configs/client1.ovpn
+          echo '</tls-auth>' >> /home/ec2-user/client-configs/client1.ovpn
+          cat /home/ec2-user/client-configs/keys/ta.key >> /home/ec2-user/client-configs/client1.ovpn
+          cp /home/ec2-user/client-configs/client1.ovpn /var/www/html/client1.ovpn
+          
+          # Display configuration file content in a simple HTML page for easy access
+          echo '<!DOCTYPE html><html><head><title>OpenVPN Client Config</title></head><body><h1>Download Your OpenVPN Client Configuration</h1><a href="client1.ovpn" download>Download client1.ovpn</a></body></html>' > /var/www/html/index.html
+          
+          if [ "$(aws ssm get-parameter --name /cloudformation/${AWS::StackName}/EnableLogging --query 'Parameter.Value' --output text)" = "Yes" ]; then
+              echo "Setting up logging"
+              yum install -y jq
+              cat > /etc/cron.d/fetch-vpc-logs <<-EOF
+              */5 * * * * root /usr/local/bin/fetch-vpc-logs.sh
+              EOF
+              
+              cat > /usr/local/bin/fetch-vpc-logs.sh <<-EOF
+              #!/bin/bash
+              tail -n 10000 /var/log/openvpn.log | jq -R -s -c 'split("\n")[:-1] | map({"message": ., "timestamp": now | todate})' > /var/www/html/logs.json
+              EOF
+              
+              chmod +x /usr/local/bin/fetch-vpc-logs.sh
+              /usr/local/bin/fetch-vpc-logs.sh
+              
+              cat > /var/www/html/logs.html <<-EOF
+              <html>
+              <head>
+                  <title>VPN Logs</title>
+              </head>
+              <body>
+                  <h1>VPN Logs</h1>
+                  <pre id="log-content"></pre>
+                  <script>
+                      function fetchLogs() {
+                          fetch('/logs.json')
+                              .then(response => response.json())
+                              .then(data => {
+                                  document.getElementById('log-content').textContent = JSON.stringify(data, null, 2);
+                              })
+                              .catch(error => console.error('Error fetching logs:', error));
+                      }
+                      setInterval(fetchLogs, 5000);
+                      fetchLogs();
+                  </script>
+              </body>
+              </html>
+              EOF
+          fi
+
+Conditions:
+  EnableFlowLogs: !Equals [!Ref EnableLogging, "Yes"]
 
 Outputs:
   VPNServerPublicIP:
     Description: Public IP address of the VPN server
     Value: !GetAtt VPNInstance.PublicIp
-  VPNClientConfig:
-    Description: OpenVPN client configuration file content
-    Value: !Sub |
-      client
-      dev tun
-      proto udp
-      remote ${VPNServerPublicIP} 1194
-      resolv-retry infinite
-      nobind
-      persist-key
-      persist-tun
-      remote-cert-tls server
-      cipher AES-256-CBC
-      auth SHA256
-      key-direction 1
-      verb 3
-      <ca>
-      -----BEGIN CERTIFICATE-----
-      # Insert CA Certificate here
-      -----END CERTIFICATE-----
-      </ca>
-      <cert>
-      -----BEGIN CERTIFICATE-----
-      # Insert Client Certificate here
-      -----END CERTIFICATE-----
-      </cert>
-      <key>
-      -----BEGIN PRIVATE KEY-----
-      # Insert Client Key here
-      -----END PRIVATE KEY-----
-      </key>
-      <tls-auth>
-      -----BEGIN OpenVPN Static key V1-----
-      # Insert TLS Auth Key here
-      -----END OpenVPN Static key V1-----
-      </tls-auth>
+  VPNClientConfigURL:
+    Description: URL to download the OpenVPN client configuration file
+    Value: !Sub "http://${VPNInstance.PublicIp}/client1.ovpn"
+  VPNLogsURL:
+    Description: URL to view VPN logs (if enabled)
+    Condition: EnableFlowLogs
+    Value: !Sub "http://${VPNInstance.PublicIp}/logs.html"
+  CostEstimation:
+    Description: |
+      Estimation of the additional costs associated with enabling logging:
+      - Local storage of logs on the server.
+      Note: Actual costs may vary based on the amount of data processed.
+    Value: !If [EnableFlowLogs, "Local log storage enabled. Costs may vary based on storage usage.", "Logging is disabled."]
