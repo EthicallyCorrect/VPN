@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to create an OpenVPN server on a t2.micro EC2 instance with minimal user interaction
+
+Parameters:
+  Region:
+    Type: String
+    Description: |
+      Select the region for your VPN:
+      - us-east-1: US East (N. Virginia)
+      - us-west-1: US West (N. California)
+      - us-west-2: US West (Oregon)
+      - eu-west-1: EU (Ireland)
+      - eu-central-1: EU (Frankfurt)
+      - ap-southeast-1: Asia Pacific (Singapore)
+      - ap-southeast-2: Asia Pacific (Sydney)
+      - ap-northeast-1: Asia Pacific (Tokyo)
+      - ap-northeast-2: Asia Pacific (Seoul)
+      - sa-east-1: South America (São Paulo)
+    AllowedValues:
+      - us-east-1
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - ap-northeast-2
+      - sa-east-1
+    ConstraintDescription: Must be a valid AWS region
+    Default: us-east-1
+
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: VPNVPC
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: VPNGateway
+
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.1.0/24'
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs !Ref "AWS::Region" ]
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  RouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  Route:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  VPNSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable VPN access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1194
+          ToPort: 1194
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: VPNSecurityGroup
+
+  VPNInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0a91cd140a1fc148a # Ubuntu Server 20.04 LTS (Replace with region-specific AMI)
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref VPNSecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y openvpn easy-rsa
+          make-cadir ~/openvpn-ca
+          cd ~/openvpn-ca
+          source vars
+          ./clean-all
+          ./build-ca --batch
+          ./build-key-server --batch server
+          ./build-dh
+          openvpn --genkey --secret keys/ta.key
+          ./build-key --batch client1
+          cp ~/openvpn-ca/keys/ca.crt /etc/openvpn/
+          cp ~/openvpn-ca/keys/server.crt /etc/openvpn/
+          cp ~/openvpn-ca/keys/server.key /etc/openvpn/
+          cp ~/openvpn-ca/keys/ta.key /etc/openvpn/
+          cp ~/openvpn-ca/keys/dh2048.pem /etc/openvpn/
+          cat > /etc/openvpn/server.conf <<-EOF
+          port 1194
+          proto udp
+          dev tun
+          ca ca.crt
+          cert server.crt
+          key server.key
+          dh dh2048.pem
+          auth SHA256
+          tls-auth ta.key 0
+          server 10.8.0.0 255.255.255.0
+          ifconfig-pool-persist ipp.txt
+          push "redirect-gateway def1 bypass-dhcp"
+          push "dhcp-option DNS 8.8.8.8"
+          push "dhcp-option DNS 8.8.4.4"
+          keepalive 10 120
+          cipher AES-256-CBC
+          user nobody
+          group nogroup
+          persist-key
+          persist-tun
+          verb 3
+          EOF
+          systemctl start openvpn@server
+          systemctl enable openvpn@server
+          mkdir -p /home/ubuntu/client-configs/keys
+          cp ~/openvpn-ca/keys/ca.crt /home/ubuntu/client-configs/keys/
+          cp ~/openvpn-ca/keys/client1.crt /home/ubuntu/client-configs/keys/
+          cp ~/openvpn-ca/keys/client1.key /home/ubuntu/client-configs/keys/
+          cp ~/openvpn-ca/keys/ta.key /home/ubuntu/client-configs/keys/
+          cat > /home/ubuntu/client-configs/base.conf <<-EOF
+          client
+          dev tun
+          proto udp
+          remote $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4) 1194
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-CBC
+          auth SHA256
+          key-direction 1
+          verb 3
+          EOF
+          cat /home/ubuntu/client-configs/base.conf > /home/ubuntu/client-configs/client1.ovpn
+          echo '<ca>' >> /home/ubuntu/client-configs/client1.ovpn
+          cat /home/ubuntu/client-configs/keys/ca.crt >> /home/ubuntu/client-configs/client1.ovpn
+          echo '</ca>' >> /home/ubuntu/client-configs/client1.ovpn
+          echo '<cert>' >> /home/ubuntu/client-configs/client1.ovpn
+          cat /home/ubuntu/client-configs/keys/client1.crt >> /home/ubuntu/client-configs/client1.ovpn
+          echo '</cert>' >> /home/ubuntu/client-configs/client1.ovpn
+          echo '<key>' >> /home/ubuntu/client-configs/client1.ovpn
+          cat /home/ubuntu/client-configs/keys/client1.key >> /home/ubuntu/client-configs/client1.ovpn
+          echo '</key>' >> /home/ubuntu/client-configs/client1.ovpn
+          echo '<tls-auth>' >> /home/ubuntu/client-configs/client1.ovpn
+          cat /home/ubuntu/client-configs/keys/ta.key >> /home/ubuntu/client-configs/client1.ovpn
+          echo '</tls-auth>' >> /home/ubuntu/client-configs/client1.ovpn
+
+Outputs:
+  VPNServerPublicIP:
+    Description: Public IP address of the VPN server
+    Value: !GetAtt VPNInstance.PublicIp
+  VPNClientConfig:
+    Description: OpenVPN client configuration file content
+    Value: !Sub |
+      client
+      dev tun
+      proto udp
+      remote ${VPNServerPublicIP} 1194
+      resolv-retry infinite
+      nobind
+      persist-key
+      persist-tun
+      remote-cert-tls server
+      cipher AES-256-CBC
+      auth SHA256
+      key-direction 1
+      verb 3
+      <ca>
+      -----BEGIN CERTIFICATE-----
+      # Insert CA Certificate here
+      -----END CERTIFICATE-----
+      </ca>
+      <cert>
+      -----BEGIN CERTIFICATE-----
+      # Insert Client Certificate here
+      -----END CERTIFICATE-----
+      </cert>
+      <key>
+      -----BEGIN PRIVATE KEY-----
+      # Insert Client Key here
+      -----END PRIVATE KEY-----
+      </key>
+      <tls-auth>
+      -----BEGIN OpenVPN Static key V1-----
+      # Insert TLS Auth Key here
+      -----END OpenVPN Static key V1-----
+      </tls-auth>
